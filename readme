@@ -1,0 +1,121 @@
+这是一份为您生成的 `README.md` 文档。它清晰地解释了脚本的功能、目录结构要求、配置方法以及执行流程，非常适合放在项目根目录下供团队成员或自己查阅。
+
+-----
+
+# 自动化模型执行脚本 (`run_model.sh`) 使用说明
+
+## 1\. 简介
+
+`run_model.sh` 是一个用于自动化配置环境并执行模型图捕获任务（`capture_pd_graphs.py`）的 Bash 脚本。
+
+该脚本的主要目的是**解决繁琐的环境依赖问题**。它会自动根据模型类型调整 `transformers` 版本，重新安装本地开发的依赖库（如 `Dist_IR`, `Ascend_IR` 等），并加载模型特定的环境变量，最后启动 Python 任务。
+
+## 2\. 目录结构要求
+
+为了确保脚本正常运行，请确保您的项目目录结构符合以下规范（基于脚本内的默认配置）：
+
+```text
+/data/new_root/Project_finally/           <-- [项目根目录] (包含依赖库)
+├── Ascend_IR/                            <-- 依赖库 (DIR_DIST_INF)
+├── Costmodel/                            <-- 依赖库 (DIR_COSTMODEL)
+├── Performance_Eval/                     <-- 依赖库 (DIR_PERF_EVAL)
+├── transform_tool_v4/                    <-- 依赖库 (DIR_TRANSFORM)
+├── kernel_meta/                          <-- 其他系统目录
+└── Ascend_llm_test/                      <-- [工作目录] 脚本和模型都在这里
+    ├── run_model.sh                      <-- [本脚本]
+    └── <模型文件夹名称>/                   <-- 例如: decapoda-research-llama-7B-hf
+        ├── capture_pd_graphs.py          <-- 目标 Python 脚本
+        ├── envs.sh                       <-- (可选) 模型特定环境变量
+        └── ...
+```
+
+## 3\. 快速开始
+
+### 3.1 赋予执行权限
+
+首次使用前，请确保脚本具有可执行权限：
+
+```bash
+chmod +x run_model.sh
+```
+
+### 3.2 运行脚本
+
+使用方法如下，只需要传入**模型文件夹的名称**（非绝对路径）：
+
+```bash
+./run_model.sh <模型文件夹名称>
+```
+
+**示例：**
+
+```bash
+# 运行 Llama 7B
+./run_model.sh decapoda-research-llama-7B-hf
+
+# 运行 DeepSeek 模型 (会自动切换高版本 transformers)
+./run_model.sh deepseek-moe-16b
+```
+
+## 4\. 脚本执行流程详解
+
+脚本按顺序执行以下步骤：
+
+1.  **参数校验**：检查模型目录是否存在，以及目录内是否包含 `capture_pd_graphs.py`。
+2.  **环境清理与配置**：
+      * **智能识别**：如果是 `deepseek` 或 `Qwen` 系列模型，安装 `transformers==4.57.3`；否则安装 `transformers==4.35.2`。
+      * **卸载旧包**：自动卸载旧版本的 `Dist_IR`, `Performance_Eval` 等本地库，防止缓存干扰。
+3.  **本地依赖安装**：
+      * 依次进入 `transform_tool_v4`, `Ascend_IR`, `Performance_Eval`, `Costmodel` 目录。
+      * 执行 `python setup.py install` 重新编译并安装最新代码。
+4.  **加载模型环境**：
+      * 检查模型目录下是否存在 `envs.sh`。如果存在，自动 `source` 加载其中的环境变量。
+5.  **执行任务**：
+      * 切换到模型目录。
+      * 运行 `python capture_pd_graphs.py --model_dir <模型路径>`。
+      * 日志将同时输出到控制台并保存到 `log_<模型名>.txt`。
+
+## 5\. 配置指南
+
+如果项目路径发生变化，请修改脚本头部的 **配置区域**：
+
+```bash
+# 1. 配置区域
+# =========================================================
+
+# 获取脚本所在的目录 (即 Ascend_llm_test)
+CURRENT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# [重要] 找到项目根目录
+# [修改点] 动态设置项目根目录
+# 逻辑：脚本在 Ascend_llm_test 下，依赖库在上一级 Project_finally 下
+# 所以 PROJECT_ROOT 就是 CURRENT_DIR 的父目录
+PROJECT_ROOT="$(dirname "$CURRENT_DIR")"
+
+# 目标 Python 脚本的文件名 (它位于模型文件夹内)
+TARGET_SCRIPT_NAME="capture_pd_graphs.py"
+
+# --- 本地依赖库目录名称定义 ---
+DIR_TRANSFORM="transform_tool_v4"
+DIR_DIST_INF="Ascend_IR"
+DIR_PERF_EVAL="Performance_Eval"
+DIR_COSTMODEL="Costmodel"
+```
+
+## 6\. 输出与日志
+
+  * **控制台输出**：使用不同颜色区分 INFO (蓝), OK (绿), WARN (黄), ERROR (红)。
+  * **日志文件**：执行完毕后，完整的运行日志会保存在脚本同级目录下，文件名为：
+    `log_<模型文件夹名称>.txt`
+
+## 7\. 常见问题 (FAQ)
+
+  * **Q: 报错 `Directory ... does not exist`?**
+      * A: 请检查 `PROJECT_ROOT` 变量是否设置正确，以及依赖库文件夹名称是否与实际一致。
+  * **Q: 报错 `Target script ... not found`?**
+      * A: 请确认您指定的模型文件夹内确实包含 `capture_pd_graphs.py` 文件。
+  * **Q: 为什么每次都要重新安装本地库？**
+      * A: 为了确保您修改过的底层代码（如 `Dist_IR`）能立即在当前运行中生效，脚本默认采用“先卸载后安装”的策略。
+
+-----
+
+*Last Updated: 2025-12-11*
