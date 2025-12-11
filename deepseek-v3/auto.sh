@@ -17,14 +17,23 @@ PROJECT_ROOT=$(cd "$CURRENT_DIR/../.." && pwd)
 echo ">> 脚本位置: $CURRENT_DIR"
 echo ">> 项目根目录: $PROJECT_ROOT"
 
+
 # =========================================================
 # 1.1 [新增] 配置依赖库目录名称 (在此处集中修改)
 # =========================================================
-DIR_TRANSFORM="transform_tool_v4"
-DIR_DIST_INF="Distributed_Parallelism_Inference_2"
-DIR_COSTMODEL="Costmodel"
-DIR_PERF_EVAL="Performance_Eval"
+#这个配置为全局的一个新.sh
+# =========================================================
+# 1.1 [修改] 加载全局配置
+CONFIG_FILE="$PROJECT_ROOT/project_config.sh"
 
+if [ -f "$CONFIG_FILE" ]; then
+    echo ">> Loading global config from: $CONFIG_FILE"
+    source "$CONFIG_FILE"
+else
+    echo "Error: Global config file '$CONFIG_FILE' not found!"
+    echo "请在项目根目录创建 project_config.sh 并定义 DIR_TRANSFORM 等变量。"
+    exit 1
+fi
 # =========================================================
 # 2. 基础环境清理与安装
 # =========================================================
@@ -70,12 +79,11 @@ install_local_pkg "$PROJECT_ROOT/$DIR_TRANSFORM"
 echo ">> [4/7] Installing $DIR_DIST_INF..."
 install_local_pkg "$PROJECT_ROOT/$DIR_DIST_INF"
 
-echo ">> [5/7] Installing $DIR_COSTMODEL..."
-install_local_pkg "$PROJECT_ROOT/$DIR_COSTMODEL"
-
 echo ">> [6/7] Installing $DIR_PERF_EVAL..."
 install_local_pkg "$PROJECT_ROOT/$DIR_PERF_EVAL"
 
+echo ">> [5/7] Installing $DIR_COSTMODEL..."
+install_local_pkg "$PROJECT_ROOT/$DIR_COSTMODEL"
 # =========================================================
 # 4. 运行主程序
 # =========================================================
@@ -98,7 +106,7 @@ fi
 echo ">> Starting Execution: $TARGET_SCRIPT"
 echo ">> Logs will be saved to: log_${TARGET_SCRIPT%.*}.txt"
 
-# 运行指定的 Python 脚本
-python "$CURRENT_DIR/$TARGET_SCRIPT" 2>&1 | tee "log_${TARGET_SCRIPT%.*}.txt"
+# 修改后 (加上 -u)
+python -u "$CURRENT_DIR/$TARGET_SCRIPT" 2>&1 | tee "log_${TARGET_SCRIPT%.*}.txt"
 
 echo ">> Done."

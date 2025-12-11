@@ -4,15 +4,18 @@ import io
 import sys
 import os
 import shutil
+import json
 from transformers import AutoConfig, AutoModelForCausalLM
 
 # --- 引入 Dist_IR 相关库 ---
 import Dist_IR
 from Dist_IR import InferenceGraphCapture, logger, KVCacheAnalyzer
 from torch.fx.passes.graph_drawer import FxGraphDrawer
+from Performance_Eval.Fake_Runtime.Simulation import Performance_Evaluation
+# from schedule_irV.SR_version1 import ScheduleSpec, build, write_ndjson
 
 # ==============================================================================
-# 1. 辅助工具函数
+# 1. 辅助工具函数 (保留在全局作用域，供子进程 import)
 # ==============================================================================
 
 def save_inference_graph(graph_module, graph_name: str):
@@ -162,148 +165,237 @@ class DeepSeekWrapper(nn.Module):
         return logits, new_cache
 
 # ==============================================================================
-# 4. 配置与初始化
+# MAIN EXECUTION BLOCK - 必须在 __name__ == "__main__" 下
 # ==============================================================================
-MODEL_NAME = "deepseek_v3"
-LOCAL_CONFIG_PATH = './deepseek_v3_local' 
-
-
-DEVICE = "cpu"
-
-BATCH_SIZE = 10
-PREFILL_SEQ_LEN = 30
-KV_CACHE_SEQ_LEN = PREFILL_SEQ_LEN 
-
-print(f"\n>> 初始化模型: Custom DeepSeek-V3 on {DEVICE}")
-
-try:
-    print(">> Loading and Overriding config...")
-    config = AutoConfig.from_pretrained(LOCAL_CONFIG_PATH, trust_remote_code=True)
-
-    # --- 瘦身配置 ---
-    config.num_hidden_layers = 1 
-    # [关键修改] 强制让第 0 层就是 MoE 层 (默认可能是 1, 导致第 0 层是 Dense)
-    config.first_k_dense_replace = 0 
-    config.moe_layer_freq = 1  # 确保频率为 1
-    config.hidden_size = 128            
-    config.intermediate_size = 512      
-    config.moe_intermediate_size = 64   
-    config.num_attention_heads = 4
-    config.num_key_value_heads = 4
-    config.max_position_embeddings = 512
+if __name__ == "__main__":
     
-    # 强制设置 MLA 参数
-    config.kv_lora_rank = 32 #k/v的维度
-    config.q_lora_rank = 64 #q维度（通常为2*k）
-    config.qk_rope_head_dim = 16 #需要位置编码的k
-    config.qk_nope_head_dim = 16 #不需要位置编码的K
-    config.v_head_dim = 32 
-    
-    TOTAL_EXPERTS = 8
-    if hasattr(config, 'n_routed_experts'): config.n_routed_experts = TOTAL_EXPERTS
-    if hasattr(config, 'num_experts_per_tok'): config.num_experts_per_tok = TOTAL_EXPERTS 
-    if hasattr(config, 'n_group'): config.n_group = 1
-    if hasattr(config, 'topk_group'): config.topk_group = 1
-    if hasattr(config, 'n_shared_experts'): config.n_shared_experts = 1
-    
-    config.attn_implementation = "eager"
-    config._attn_implementation = "eager"
+    # ==============================================================================
+    # 4. 配置与初始化
+    # ==============================================================================
+    MODEL_NAME = "deepseek_v3"
+    LOCAL_CONFIG_PATH = './deepseek_v3_local' 
 
-    # 实例化模型
-    raw_model = AutoModelForCausalLM.from_config(config, trust_remote_code=True).to(DEVICE)
-    
-    # [关键步骤] 获取模型的真实 dtype (通常是 bfloat16 或 float32)
-    # 这决定了后续所有 inputs 必须匹配这个类型
-    MODEL_DTYPE = raw_model.dtype
-    print(f">> Model initialized with dtype: {MODEL_DTYPE}")
+    DEVICE = "cpu"
 
-    patch_deepseek_moe_infer(raw_model)
-    model = DeepSeekWrapper(raw_model).to(DEVICE)
-    model.eval()
+    BATCH_SIZE = 10
+    PREFILL_SEQ_LEN = 30
+    KV_CACHE_SEQ_LEN = PREFILL_SEQ_LEN 
 
-except Exception as e:
-    import traceback
-    traceback.print_exc()
-    sys.exit(f"模型初始化失败: {e}")
+    print(f"\n>> 初始化模型: Custom DeepSeek-V3 on {DEVICE}")
 
-# ==============================================================================
-# 5. 图捕获 (Prefill & Decode)
-# ==============================================================================
+    try:
+        print(">> Loading and Overriding config...")
+        config = AutoConfig.from_pretrained(LOCAL_CONFIG_PATH, trust_remote_code=True)
 
-with torch.no_grad():
+        # --- 瘦身配置 ---
+        config.num_hidden_layers = 1 
+        # [关键修改] 强制让第 0 层就是 MoE 层 (默认可能是 1, 导致第 0 层是 Dense)
+        config.first_k_dense_replace = 0 
+        config.moe_layer_freq = 1  # 确保频率为 1
+        config.hidden_size = 128            
+        config.intermediate_size = 512      
+        config.moe_intermediate_size = 64   
+        config.num_attention_heads = 4
+        config.num_key_value_heads = 4
+        config.max_position_embeddings = 512
+        
+        # 强制设置 MLA 参数
+        config.kv_lora_rank = 32 #k/v的维度
+        config.q_lora_rank = 64 #q维度（通常为2*k）
+        config.qk_rope_head_dim = 16 #需要位置编码的k
+        config.qk_nope_head_dim = 16 #不需要位置编码的K
+        config.v_head_dim = 32 
+        
+        TOTAL_EXPERTS = 8
+        if hasattr(config, 'n_routed_experts'): config.n_routed_experts = TOTAL_EXPERTS
+        if hasattr(config, 'num_experts_per_tok'): config.num_experts_per_tok = TOTAL_EXPERTS 
+        if hasattr(config, 'n_group'): config.n_group = 1
+        if hasattr(config, 'topk_group'): config.topk_group = 1
+        if hasattr(config, 'n_shared_experts'): config.n_shared_experts = 1
+        
+        config.attn_implementation = "eager"
+        config._attn_implementation = "eager"
 
-    # --- A. Prefill 阶段 ---
+        # 实例化模型
+        raw_model = AutoModelForCausalLM.from_config(config, trust_remote_code=True).to(DEVICE)
+        
+        # [关键步骤] 获取模型的真实 dtype (通常是 bfloat16 或 float32)
+        # 这决定了后续所有 inputs 必须匹配这个类型
+        MODEL_DTYPE = raw_model.dtype
+        print(f">> Model initialized with dtype: {MODEL_DTYPE}")
+
+        patch_deepseek_moe_infer(raw_model)
+        model = DeepSeekWrapper(raw_model).to(DEVICE)
+        model.eval()
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        sys.exit(f"模型初始化失败: {e}")
+
+    # ==============================================================================
+    # 5. 图捕获 (Prefill & Decode)
+    # ==============================================================================
+
+    with torch.no_grad():
+
+        # --- A. Prefill 阶段 ---
+        print("\n" + "="*40)
+        print("Step 1: 捕获 Prefill 图")
+        
+        # [修改] Mask 必须转为 MODEL_DTYPE，否则是 Float32
+        _mask = torch.tril(torch.ones((PREFILL_SEQ_LEN, PREFILL_SEQ_LEN), device=DEVICE, dtype=MODEL_DTYPE))
+        prefill_mask = _mask[None, None, :, :]
+        
+        prefill_inputs = { 
+            'input_ids': torch.randint(0, config.vocab_size, (BATCH_SIZE, PREFILL_SEQ_LEN), device=DEVICE),
+            'attention_mask': prefill_mask,
+            'past_key_values': None 
+        }
+        
+        prefill_capture = InferenceGraphCapture(model, filename_prefix="deepseek_prefill", **prefill_inputs)
+        compiled_prefill = prefill_capture.compile()
+        compiled_prefill(**prefill_inputs)
+        
+        # --- B. Decode 阶段 ---
+        print("\n" + "="*40)
+        print("Step 2: 捕获 Decode 图")
+        
+        # [修改] Mask 必须转为 MODEL_DTYPE
+        total_len = KV_CACHE_SEQ_LEN + 1
+        decode_mask = torch.ones((BATCH_SIZE, 1, 1, total_len), device=DEVICE, dtype=MODEL_DTYPE)
+
+        # [修改] Cache 必须使用 MODEL_DTYPE
+        dummy_cache = create_flat_kv_cache(config, BATCH_SIZE, KV_CACHE_SEQ_LEN, device=DEVICE, dtype=MODEL_DTYPE)
+        
+        decode_inputs = { 
+            'input_ids': torch.randint(0, config.vocab_size, (BATCH_SIZE, 1), device=DEVICE),
+            'attention_mask': decode_mask, 
+            'past_key_values': dummy_cache
+        }
+        
+        decode_capture = InferenceGraphCapture(model, filename_prefix="deepseek_decode", **decode_inputs)
+        compiled_decode = decode_capture.compile()
+        compiled_decode(**decode_inputs)
+
+    # ==============================================================================
+    # 6. 分析与并行切分
+    # ==============================================================================
+
     print("\n" + "="*40)
-    print("Step 1: 捕获 Prefill 图")
-    
-    # [修改] Mask 必须转为 MODEL_DTYPE，否则是 Float32
-    _mask = torch.tril(torch.ones((PREFILL_SEQ_LEN, PREFILL_SEQ_LEN), device=DEVICE, dtype=MODEL_DTYPE))
-    prefill_mask = _mask[None, None, :, :]
-    
-    prefill_inputs = { 
-        'input_ids': torch.randint(0, config.vocab_size, (BATCH_SIZE, PREFILL_SEQ_LEN), device=DEVICE),
-        'attention_mask': prefill_mask,
-        'past_key_values': None 
-    }
-    
-    prefill_capture = InferenceGraphCapture(model, filename_prefix="deepseek_prefill", **prefill_inputs)
-    compiled_prefill = prefill_capture.compile()
-    compiled_prefill(**prefill_inputs)
-    
-    # --- B. Decode 阶段 ---
-    print("\n" + "="*40)
-    print("Step 2: 捕获 Decode 图")
-    
-    # [修改] Mask 必须转为 MODEL_DTYPE
-    total_len = KV_CACHE_SEQ_LEN + 1
-    decode_mask = torch.ones((BATCH_SIZE, 1, 1, total_len), device=DEVICE, dtype=MODEL_DTYPE)
+    print("Step 3: 运行 Dist_IR Pass (Analysis & Positioning)")
+    print("="*40)
 
-    # [修改] Cache 必须使用 MODEL_DTYPE
-    dummy_cache = create_flat_kv_cache(config, BATCH_SIZE, KV_CACHE_SEQ_LEN, device=DEVICE, dtype=MODEL_DTYPE)
-    
-    decode_inputs = { 
-        'input_ids': torch.randint(0, config.vocab_size, (BATCH_SIZE, 1), device=DEVICE),
-        'attention_mask': decode_mask, 
-        'past_key_values': dummy_cache
-    }
-    
-    decode_capture = InferenceGraphCapture(model, filename_prefix="deepseek_decode", **decode_inputs)
-    compiled_decode = decode_capture.compile()
-    compiled_decode(**decode_inputs)
+    # --- A. Prefill ---
+    if prefill_capture.FW_gm:
+        print(">> Processing Prefill Graph...")
+        Dist_IR.KVCacheAnalyzer(prefill_capture.FW_gm, "prefill", MODEL_NAME, config)
+        pos_prefill = Dist_IR.Pos(raw_model, prefill_capture.FW_gm, None, model_name='deepseek')
+        pos_prefill.positioning_for_graph()
+        pos_prefill.log_node_positioning_info()
+        
+        prefill_graph=Dist_IR.Hybrid_Parallel_pass(
+            prefill_capture.FW_gm, None, None, 
+            Global_batch_size=BATCH_SIZE, inference_stage='prefill'
+        )
+        save_inference_graph(prefill_capture.FW_gm, "deepseek_prefill")
 
-# ==============================================================================
-# 6. 分析与并行切分
-# ==============================================================================
+    # --- B. Decode ---
+    if decode_capture.FW_gm:
+        print("\n>> Processing Decode Graph...")
+        Dist_IR.KVCacheAnalyzer(decode_capture.FW_gm, "decode", MODEL_NAME, config)
+        pos_decode = Dist_IR.Pos(raw_model, decode_capture.FW_gm, None, model_name='deepseek')
+        pos_decode.positioning_for_graph()
+        
+        decode_graph=Dist_IR.Hybrid_Parallel_pass(
+            decode_capture.FW_gm, None, None, 
+            Global_batch_size=BATCH_SIZE, inference_stage='decode'
+        )
+        save_inference_graph(decode_capture.FW_gm, "deepseek_decode")
 
-print("\n" + "="*40)
-print("Step 3: 运行 Dist_IR Pass (Analysis & Positioning)")
-print("="*40)
+    print("\nDone. DeepSeek-V3 (EP Optimized) graphs generated.")
 
-# --- A. Prefill ---
-if prefill_capture.FW_gm:
-    print(">> Processing Prefill Graph...")
-    Dist_IR.KVCacheAnalyzer(prefill_capture.FW_gm, "prefill", MODEL_NAME, config)
-    pos_prefill = Dist_IR.Pos(raw_model, prefill_capture.FW_gm, None, model_name='deepseek')
-    pos_prefill.positioning_for_graph()
-    pos_prefill.log_node_positioning_info()
-    
-    Dist_IR.Hybrid_Parallel_pass(
-        prefill_capture.FW_gm, None, None, 
-        Global_batch_size=BATCH_SIZE, inference_stage='prefill'
-    )
-    save_inference_graph(prefill_capture.FW_gm, "deepseek_prefill")
 
-# --- B. Decode ---
-if decode_capture.FW_gm:
-    print("\n>> Processing Decode Graph...")
-    Dist_IR.KVCacheAnalyzer(decode_capture.FW_gm, "decode", MODEL_NAME, config)
-    pos_decode = Dist_IR.Pos(raw_model, decode_capture.FW_gm, None, model_name='deepseek')
-    pos_decode.positioning_for_graph()
-    
-    Dist_IR.Hybrid_Parallel_pass(
-        decode_capture.FW_gm, None, None, 
-        Global_batch_size=BATCH_SIZE, inference_stage='decode'
-    )
-    save_inference_graph(decode_capture.FW_gm, "deepseek_decode")
+    from Performance_Eval.Fake_Runtime.PD_separation import PD_Performance_Eval
 
-print("\nDone. DeepSeek-V3 (EP Optimized) graphs generated.")
+    Eval = PD_Performance_Eval(prefill_capture.FW_gm, decode_capture.FW_gm, prefill_graph, decode_graph, PREFILL_SEQ_LEN, 2)
+    time = Eval.Evaluate()
+
+    print(f"最终结果: {time} us")
+
+    # ==============================================================================
+    # 7. 性能评估 (Evaluation) - 必须在 main 块内
+    # ==============================================================================
+
+    # Eval = Performance_Evaluation(decode_graph)
+    # time,time_list = Eval.Evaluate()
+
+    print(f"最终结果: {time} us")
+
+    # # ==============================================================================
+    # # 8. Schedule 生成与文件输出
+    # # ==============================================================================
+
+    # cfg = {
+    #   "name": "pp_demo",
+    #   "strategy": "gpipe",         
+    #   "num_stages": 2,
+    #   "num_mini": 2,
+    #   "num_micro": 3,
+    #   "lanes": {"compute": 0, "comm": 1, "custom": 2},
+    #   "stage_durations": {"forward": [240, 240, 240], "backward": [240, 240, 240]},
+    #   ## "meta": { "virtual_chunks": 2 } (当strategy是interleaved的时候，这个可以做chunk切分)
+    #   "insertions": [
+    #     {
+    #       "name": "cast_activation",
+    #       "op": "Cast",
+    #       "phase": "forward",
+    #       "anchor": "host_start",
+    #       "offset": 0,
+    #       "duration": {"ratio_of_host": 0.1},
+    #       "lane": "custom", #“compute” or “comm”
+    #       "stage_selector": "all",
+    #       "micro_selector": "all",
+    #       "mini_selector": "all"
+    #     }
+    #   ],
+    #   "emit": {"include_comments": True}
+    # }
+
+    # prefill_cfg_str = os.getenv("dist_config")
+    # if prefill_cfg_str is None:
+    #     raise RuntimeError("环境变量 dist_config 没有设置")
+    # prefill_cfg = json.loads(prefill_cfg_str)
+
+    # pd = prefill_cfg["prefill"]["parallel_degree"]
+    # D = pd["D"]
+    # P = pd["P"]
+    # T = pd["T"]
+    # S = pd["S"]
+
+    # list=[]
+    # stage_numb = P
+    # device_list=[]
+
+    # for i in range(stage_numb):
+    #     device_number= i * T * S 
+    #     device_list.append(device_number)
+
+    # for i in range(len(device_list)):
+    #     if i == 0:
+    #         temp0 = device_list[0]
+    #         list.append(time_list[temp0])
+    #     else :
+    #         temp1 = device_list[i]
+    #         temp2 = device_list[i-1]
+    #         time_difference_stage= time_list[temp1]-time_list[temp2]
+    #         list.append(time_difference_stage)
+
+    # cfg["stage_durations"]["forward"] = list
+    # cfg["stage_durations"]["backward"] = list
+    # spec = ScheduleSpec(cfg)
+    # events = build(spec)
+    # with open("out.ndjson", "w", encoding="utf-8") as f:
+    #     write_ndjson(f, events, include_comments=spec.emit.get("include_comments", True))
+
+    # print("Wrote out.ndjson with", len(events), "events")
